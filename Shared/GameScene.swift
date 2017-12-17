@@ -6,19 +6,29 @@
 //  Copyright © 2017 JwitApps. All rights reserved.
 //
 
+import GameController
+import GameplayKit
 import SpriteKit
-#if os(watchOS)
-    import WatchKit
-    // SKColor typealias does not seem to be exposed on watchOS SpriteKit
-    typealias SKColor = UIColor
-#endif
+
+struct Pad {
+    let location: CGPoint
+    let node: SKNode
+}
 
 class GameScene: SKScene {
     
+    var controller: GCController?
     
-    fileprivate var label : SKLabelNode?
-    fileprivate var spinnyNode : SKShapeNode?
+    // relative to pad layer
+    var playerRestingPosition: CGPoint?
 
+    func controllerDidConnect(notification : NSNotification) {
+        controller = GCController.controllers().first
+        controller?.motion?.valueChangedHandler = { motion in
+            
+            self.player.physicsBody?.applyImpulse(CGVector(dx: -10*motion.gravity.y, dy: 0))
+        }
+    }
     
     class func newGameScene() -> GameScene {
         // Load 'GameScene.sks' as an SKScene.
@@ -30,63 +40,169 @@ class GameScene: SKScene {
         // Set the scale mode to scale to fit the window
         scene.scaleMode = .aspectFill
         
+        let camera = SKCameraNode()
+        scene.camera = camera
+        camera.zPosition = 1000
+        scene.addChild(camera)
+        
+        scene.physicsWorld.contactDelegate = scene
+        
         return scene
     }
     
+    lazy var player: SKShapeNode = {
+        let node = SKShapeNode(circleOfRadius: 30)
+        node.fillColor = .red
+        node.strokeColor = .clear
+        
+        let body = SKPhysicsBody(circleOfRadius: 30)
+        body.categoryBitMask = 1
+        body.collisionBitMask = 0
+        body.contactTestBitMask = 2
+        body.mass = 1
+        node.physicsBody = body
+        
+        return node
+    }()
+    
+    lazy var padLayer: SKNode = {
+        let node = SKShapeNode(rectOf: CGSize(width: 10, height: 10))
+        node.fillColor = .green
+        return node
+    }()
+    
+    var pads = [Pad]()
+    
+    var readyToJump = true
+    
     func setUpScene() {
-        // Get label node from scene and store it for use later
-        self.label = self.childNode(withName: "//helloLabel") as? SKLabelNode
-        if let label = self.label {
-            label.alpha = 0.0
-            label.run(SKAction.fadeIn(withDuration: 2.0))
-        }
+
+        player.position = CGPoint(x: 0, y: 280)
+        addChild(player)
+
+        let body = SKPhysicsBody(rectangleOf: CGSize(width: 10, height: 1))
+        body.velocity = CGVector(dx: 0, dy: -40)
+
+        body.collisionBitMask = 0
+        body.friction = 0
+        body.linearDamping = 0
+        body.affectedByGravity = false
+        padLayer.physicsBody = body
         
-        // Create shape node to use during mouse interaction
-        let w = (self.size.width + self.size.height) * 0.05
-        self.spinnyNode = SKShapeNode.init(rectOf: CGSize.init(width: w, height: w), cornerRadius: w * 0.3)
+        generate(8, padsIn: padLayer)
         
-        if let spinnyNode = self.spinnyNode {
-            spinnyNode.lineWidth = 4.0
-            spinnyNode.run(SKAction.repeatForever(SKAction.rotate(byAngle: CGFloat(Double.pi), duration: 1)))
-            spinnyNode.run(SKAction.sequence([SKAction.wait(forDuration: 0.5),
-                                              SKAction.fadeOut(withDuration: 0.5),
-                                              SKAction.removeFromParent()]))
-            
-            #if os(watchOS)
-                // For watch we just periodically create one of these and let it spin
-                // For other platforms we let user touch/mouse events create these
-                spinnyNode.position = CGPoint(x: 0.0, y: 0.0)
-                spinnyNode.strokeColor = SKColor.red
-                self.run(SKAction.repeatForever(SKAction.sequence([SKAction.wait(forDuration: 2.0),
-                                                                   SKAction.run({
-                                                                       let n = spinnyNode.copy() as! SKShapeNode
-                                                                       self.addChild(n)
-                                                                   })])))
-            #endif
-        }
+        addChild(padLayer)
     }
     
-    #if os(watchOS)
-    override func sceneDidLoad() {
-        self.setUpScene()
-    }
-    #else
-    override func didMove(to view: SKView) {
-        self.setUpScene()
-    }
-    #endif
-
-    func makeSpinny(at pos: CGPoint, color: SKColor) {
-        if let spinny = self.spinnyNode?.copy() as! SKShapeNode? {
-            spinny.position = pos
-            spinny.strokeColor = color
-            self.addChild(spinny)
+    func generate(_ quantity: Int, padsIn parent: SKNode) {
+        var lastPadLocation: CGPoint? { return pads.last?.location }
+        
+        for _ in 0..<quantity {
+            let spreadRadius: CGFloat = 150
+            
+            var x = lastPadLocation?.x ?? 0 - spreadRadius
+            x = x < 0 ? 0 : x
+            x = x > self.scene!.size.width/2 ? self.scene!.size.width/2 : x
+            
+            let randomizer = GKRandomDistribution(
+                lowestValue: Int(x - spreadRadius),
+                highestValue: Int(x + spreadRadius))
+            
+            let pad = createPad()
+            pad.position = CGPoint(x: randomizer.nextInt(), y: Int(lastPadLocation?.y ?? 0) + 150)
+            
+            pads.append(Pad(location: pad.position, node: pad))
+            
+            parent.addChild(pad)
         }
+    }
+   
+    override func didMove(to view: SKView) {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(GameScene.controllerDidConnect(notification:)),
+            name: NSNotification.Name.GCControllerDidConnect,
+            object: nil)
+        
+        setUpScene()
     }
     
     override func update(_ currentTime: TimeInterval) {
-        // Called before each frame is rendered
+        checkExpiredPads()
+        
+        checkGameOver()
     }
+    
+    override func didSimulatePhysics() {
+        pads.forEach { $0.node.position = $0.location }
+        
+        if let playerRestingPosition = playerRestingPosition {
+            
+            player.position = player.parent!.convert(playerRestingPosition, from: padLayer)
+            
+        }
+    }
+    
+    private func checkExpiredPads() {
+        if let pad = pads.first {
+            if self.scene!.convert(pad.node.position, from: pad.node.parent!).y < -self.scene!.size.height/2 {
+                
+                pad.node.removeFromParent()
+                pads.removeFirst()
+                print("removed")
+                
+                generate(1, padsIn: padLayer)
+            }
+        }
+    }
+    
+    private func checkGameOver() {
+        guard let scene = self.scene else { return }
+        guard let playerParent = player.parent else { return }
+        
+        if scene.convert(player.position, from: playerParent).y < -scene.size.height/2 {
+            
+            let gameOver = SKShapeNode(rectOf: CGSize(width: 300, height: 200))
+            gameOver.fillColor = .lightGray
+            self.camera?.addChild(gameOver)
+        }
+    }
+    
+    private func createPad() -> SKSpriteNode {
+        print("pad created")
+        
+        let node = SKSpriteNode(color: .blue, size: CGSize(width: 200, height: 20))
+        
+        let body = SKPhysicsBody(rectangleOf: node.size)
+        body.categoryBitMask = 2
+        body.collisionBitMask = 0
+        body.contactTestBitMask = 1
+        body.affectedByGravity = false
+        body.mass = 100000000
+        node.physicsBody = body
+        
+        return node
+    }
+}
+
+extension GameScene: SKPhysicsContactDelegate {
+    
+    func didBegin(_ contact: SKPhysicsContact) {
+        let bodyA = contact.bodyA
+        let bodyB = contact.bodyB
+        
+        if (bodyA.categoryBitMask == 1 && bodyB.categoryBitMask == 2) ||
+            bodyA.categoryBitMask == 2 && bodyB.categoryBitMask == 1 {
+            
+            if contact.contactNormal.dy > 0 {
+                
+                player.physicsBody?.velocity = .zero
+                
+                playerRestingPosition = padLayer.convert(player.position, from: player.parent!)
+            }
+        }
+    }
+    
 }
 
 #if os(iOS) || os(tvOS)
@@ -94,56 +210,13 @@ class GameScene: SKScene {
 extension GameScene {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if let label = self.label {
-            label.run(SKAction.init(named: "Pulse")!, withKey: "fadeInOut")
-        }
-        
-        for t in touches {
-            self.makeSpinny(at: t.location(in: self), color: SKColor.green)
-        }
-    }
-    
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches {
-            self.makeSpinny(at: t.location(in: self), color: SKColor.blue)
+        for _ in touches {
+            if readyToJump || true {
+                player.physicsBody?.applyImpulse(CGVector(dx: 0, dy: 600))
+                readyToJump = false
+                playerRestingPosition = nil
+            }
         }
     }
-    
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches {
-            self.makeSpinny(at: t.location(in: self), color: SKColor.red)
-        }
-    }
-    
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches {
-            self.makeSpinny(at: t.location(in: self), color: SKColor.red)
-        }
-    }
-    
-   
 }
 #endif
-
-#if os(OSX)
-// Mouse-based event handling
-extension GameScene {
-
-    override func mouseDown(with event: NSEvent) {
-        if let label = self.label {
-            label.run(SKAction.init(named: "Pulse")!, withKey: "fadeInOut")
-        }
-        self.makeSpinny(at: event.location(in: self), color: SKColor.green)
-    }
-    
-    override func mouseDragged(with event: NSEvent) {
-        self.makeSpinny(at: event.location(in: self), color: SKColor.blue)
-    }
-    
-    override func mouseUp(with event: NSEvent) {
-        self.makeSpinny(at: event.location(in: self), color: SKColor.red)
-    }
-
-}
-#endif
-
